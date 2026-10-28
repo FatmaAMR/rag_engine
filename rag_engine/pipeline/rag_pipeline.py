@@ -1,10 +1,22 @@
 import re
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Set
 from core.schemas import GenerationResult
 from core.interfaces import BaseGenerator
 from pipeline.retrieval_pipeline import RetrievalPipeline
 from core.registry import registry
 import components.generators
+
+
+def _tokenize_content(text: str) -> Set[str]:
+    stop = {
+        "the", "and", "for", "that", "this", "with", "from", "was", "were",
+        "are", "have", "has", "had", "not", "but", "what", "who", "when",
+        "where", "how", "which", "into", "their", "they", "them", "can"
+    }
+    return {
+        w for w in re.findall(r"[a-zA-Z0-9_\u0600-\u06FF]{3,}", text.lower())
+        if w not in stop
+    }
 
 
 class EndToEndRAGPipeline:
@@ -16,6 +28,16 @@ class EndToEndRAGPipeline:
     ):
         self.config = config
         self.retrieval_pipeline = retrieval_pipeline
+
+        guard_cfg = config.get("guardrails", {})
+        self.min_citation_overlap = int(guard_cfg.get("min_citation_token_overlap", 3))
+        self.max_snippet_chars = int(guard_cfg.get("max_snippet_preview_chars", 200))
+        self.refusal_phrases = tuple(
+            guard_cfg.get(
+                "refusal_phrases",
+                ["do not specifically discuss", "does not contain", "do not cover", "cannot answer", "insufficient"],
+            )
+        )
 
         if generator is not None:
             self.generator = generator
@@ -60,6 +82,19 @@ class EndToEndRAGPipeline:
             int(m) for m in re.findall(r"\[Source\s+(\d+)\]", answer_text, flags=re.IGNORECASE)
         }
 
+        is_refusal = any(p.lower() in answer_text.lower() for p in self.refusal_phrases)
+
+        if not cited_indices and not is_refusal and retrieval_res.ranked_chunks:
+            ans_tokens = _tokenize_content(answer_text)
+            inferred_refs = []
+            for idx, c in enumerate(retrieval_res.ranked_chunks, start=1):
+                c_tokens = _tokenize_content(c.text)
+                if len(ans_tokens & c_tokens) >= self.min_citation_overlap:
+                    cited_indices.add(idx)
+                    inferred_refs.append(f"[Source {idx}]")
+            if inferred_refs:
+                answer_text = f"{answer_text.rstrip()} {' '.join(inferred_refs)}"
+
         sources: List[Dict[str, Any]] = []
         for idx, c in enumerate(retrieval_res.ranked_chunks, start=1):
             sources.append(
@@ -71,7 +106,8 @@ class EndToEndRAGPipeline:
                     "section": c.metadata.page_or_section,
                     "source_name": c.metadata.source_name,
                     "rerank_score": c.rerank_score,
-                    "snippet": c.text[:200] + ("..." if len(c.text) > 200 else ""),
+                    "snippet": c.text[: self.max_snippet_chars]
+                    + ("..." if len(c.text) > self.max_snippet_chars else ""),
                 }
             )
 

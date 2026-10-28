@@ -1,44 +1,56 @@
 import os
-import re
-from pathlib import Path
 from typing import List, Dict, Any, Optional
 from core.interfaces import BaseGenerator
 from core.registry import registry
+from core.config_loader import load_dotenv_file
 
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a strict, evidence-based technical AI assistant.\n"
+    "RULES:\n"
+    "1. Answer the question using ONLY the provided Context Chunks.\n"
+    "2. You MUST cite the exact source number at the end of every factual sentence using [Source 1], [Source 2], etc.\n"
+    "3. Never use outside knowledge. If the context does not contain the answer, state clearly that the provided documents do not cover that specific detail."
+)
 
-def _load_dotenv_override() -> None:
-    env_path = Path(__file__).resolve().parent.parent.parent.parent / ".env"
-    if env_path.exists():
-        for line in env_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                os.environ[k.strip()] = v.strip().strip('"').strip("'")
+DEFAULT_USER_TEMPLATE = (
+    "Context Chunks:\n{context_text}\n\n"
+    "Question: {query}\n\n"
+    "Provide a clear answer with mandatory inline [Source X] citations:"
+)
 
 
 @registry.register_generator("groq_generator")
 class GroqGenerator(BaseGenerator):
-    EXCLUDED_KEYWORDS = ("whisper", "orpheus", "tts", "guard", "playai", "embed")
-    PREFERRED_DEFAULTS = ("qwen/qwen3.8-27b", "openai/gpt-oss-120b", "allam-2-7b", "openai/gpt-oss-20b")
-
     def __init__(
         self,
         model_name: str = "allam-2-7b",
         temperature: float = 0.1,
         max_tokens: int = 1024,
         api_key: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        user_prompt_template: Optional[str] = None,
+        preferred_defaults: Optional[List[str]] = None,
+        excluded_model_keywords: Optional[List[str]] = None,
     ):
-        _load_dotenv_override()
-        self.model_name = os.getenv("RAG_LLM_MODEL") or model_name
-        self.temperature = float(os.getenv("RAG_LLM_TEMP", temperature))
-        self.max_tokens = int(os.getenv("RAG_LLM_MAX_TOKENS", max_tokens))
+        load_dotenv_file()
+        self.model_name = str(model_name)
+        self.temperature = float(temperature)
+        self.max_tokens = int(max_tokens)
+        self.system_prompt = (system_prompt or DEFAULT_SYSTEM_PROMPT).strip()
+        self.user_prompt_template = (user_prompt_template or DEFAULT_USER_TEMPLATE).strip()
+        self.preferred_defaults = tuple(
+            preferred_defaults or ("allam-2-7b", "qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b")
+        )
+        self.excluded_keywords = tuple(
+            excluded_model_keywords or ("whisper", "orpheus", "tts", "guard", "playai", "embed")
+        )
         self._explicit_api_key = api_key
         self._client = None
         self._available_models: Optional[List[str]] = None
 
     def _get_client(self):
         if self._client is None:
-            _load_dotenv_override()
+            load_dotenv_file()
             resolved_key = self._explicit_api_key or os.getenv("GROQ_API_KEY")
             if not resolved_key:
                 raise ValueError("Groq API key is missing. Set GROQ_API_KEY in .env or environment.")
@@ -52,17 +64,15 @@ class GroqGenerator(BaseGenerator):
             raw_models = [m.id for m in client.models.list().data]
             self._available_models = sorted([
                 m for m in raw_models
-                if not any(ex in m.lower() for ex in self.EXCLUDED_KEYWORDS)
+                if not any(ex in m.lower() for ex in self.excluded_keywords)
             ])
         return self._available_models
 
     def _resolve_active_model(self) -> str:
         available = self.list_available_models()
-        if not available:
+        if not available or self.model_name in available:
             return self.model_name
-        if self.model_name in available:
-            return self.model_name
-        for pref in self.PREFERRED_DEFAULTS:
+        for pref in self.preferred_defaults:
             if pref in available:
                 self.model_name = pref
                 return self.model_name
@@ -78,25 +88,15 @@ class GroqGenerator(BaseGenerator):
             for i, c in enumerate(context_chunks)
         )
 
-        system_prompt = (
-            "You are a strict, evidence-based technical AI assistant.\n"
-            "RULES:\n"
-            "1. Answer the question using ONLY the provided Context Chunks.\n"
-            "2. You MUST cite the exact source number at the end of every factual sentence using the bracketed format [Source 1], [Source 2], etc.\n"
-            "3. Example of required citation style: 'The Transformer architecture was introduced by Ashish Vaswani at Google Brain in June 2017 [Source 1].'\n"
-            "4. Never use outside knowledge. If the context does not contain the answer, state clearly that the provided documents do not cover that specific detail."
-        )
-
-        user_prompt = (
-            f"Context Chunks:\n{context_text}\n\n"
-            f"Question: {query}\n\n"
-            "Provide a clear answer with mandatory inline [Source X] citations:"
+        user_prompt = self.user_prompt_template.format(
+            context_text=context_text,
+            query=query,
         )
 
         response = client.chat.completions.create(
             model=active_model,
             messages=[
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": self.system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=self.temperature,
@@ -119,7 +119,7 @@ class GroqGenerator(BaseGenerator):
 
 @registry.register_generator("extractive_mock_generator")
 class ExtractiveMockGenerator(BaseGenerator):
-    def __init__(self, model_name: str = "extractive-deterministic-v1"):
+    def __init__(self, model_name: str = "extractive-deterministic-v1", **kwargs):
         self.model_name = model_name
 
     def list_available_models(self) -> List[str]:
