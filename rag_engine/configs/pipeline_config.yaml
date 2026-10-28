@@ -38,8 +38,9 @@ ingestion:
 retrieval:
   abstention_threshold: 0.2
   embedder:
-    name: "hash_embedder"
+    name: "fastembed_embedder"
     params:
+      model_name: "BAAI/bge-small-en-v1.5"
       dim: 384
   vector_store:
     provider: "pgvector_store"

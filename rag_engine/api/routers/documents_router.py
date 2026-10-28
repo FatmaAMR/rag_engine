@@ -1,13 +1,7 @@
-from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, status
-from api.dependencies import get_pipeline
-from pipeline.ingestion_pipeline import IngestionPipeline
-
-router = APIRouter(prefix="/documents", tags=["Documents Management"])
-
-
 from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, status, Response
-from api.dependencies import get_pipeline
+from api.dependencies import get_pipeline, get_retrieval_pipeline
 from pipeline.ingestion_pipeline import IngestionPipeline
+from pipeline.retrieval_pipeline import RetrievalPipeline
 
 router = APIRouter(prefix="/documents", tags=["Documents Management"])
 
@@ -20,7 +14,10 @@ async def upload_document(
     version_date: str = Form("N/A"),
     source_link: str = Form("db://raw_files"),
     auto_chunk: bool = Form(True),
+    auto_index: bool = Form(True),
+    force_reprocess: bool = Form(False),
     pipeline: IngestionPipeline = Depends(get_pipeline),
+    retrieval_pipeline: RetrievalPipeline = Depends(get_retrieval_pipeline),
 ):
     raw_bytes = await file.read()
     try:
@@ -31,22 +28,33 @@ async def upload_document(
             version_date=version_date,
             source_link=source_link,
         )
-        
-        # SWE Decision: Dynamic HTTP Status Code based on Idempotency
-        if upload_res.get("deduplicated"):
+
+        if upload_res.get("deduplicated") and not force_reprocess:
             response.status_code = status.HTTP_200_OK
         else:
             response.status_code = status.HTTP_201_CREATED
 
+        file_id = upload_res["file_id"]
         chunk_info = None
+        index_info = None
+
         if auto_chunk:
-            chunk_res = pipeline.run_chunking_for_file(upload_res["file_id"], force_rechunk=False)
+            chunk_res = pipeline.run_chunking_for_file(file_id, force_rechunk=force_reprocess)
             chunk_info = {
                 "chunking_status": chunk_res["status"],
                 "config_hash": chunk_res["config_hash"],
                 "chunk_count": chunk_res["chunk_count"],
             }
-        return {**upload_res, "chunking": chunk_info}
+
+            if auto_index and chunk_res["chunk_count"] > 0:
+                index_info = retrieval_pipeline.index_file_chunks(file_id)
+
+        return {
+            **upload_res,
+            "chunking": chunk_info,
+            "indexing": index_info,
+            "ready_for_search": bool(index_info and index_info.get("indexed_chunks", 0) > 0),
+        }
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
