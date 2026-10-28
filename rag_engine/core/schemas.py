@@ -109,3 +109,10 @@ class GenerationResult:
     abstained: bool
     model_name: str
     token_usage: Dict[str, int] = field(default_factory=dict)
+
+@dataclass
+class ScoredChunk(DocumentChunk):
+    similarity_score: float = 0.0
+    lexical_score: float = 0.0
+    rrf_score: float = 0.0
+    rerank_score: float = 0.0

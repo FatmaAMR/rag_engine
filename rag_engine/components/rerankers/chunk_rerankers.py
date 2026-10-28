@@ -1,5 +1,5 @@
 import re
-from typing import List, Set
+from typing import List, Set, Optional
 from core.interfaces import BaseReranker
 from core.schemas import ScoredChunk
 from core.registry import registry
@@ -28,15 +28,22 @@ class HybridOverlapReranker(BaseReranker):
         self.semantic_weight = semantic_weight
         self.lexical_weight = lexical_weight
 
-    def rerank(self, query: str, candidates: List[ScoredChunk], top_k: int = 5) -> List[ScoredChunk]:
-        if not candidates:
+    def rerank(
+        self,
+        query: str,
+        candidates: Optional[List[ScoredChunk]] = None,
+        chunks: Optional[List[ScoredChunk]] = None,
+        top_k: int = 5,
+    ) -> List[ScoredChunk]:
+        items = candidates if candidates is not None else (chunks or [])
+        if not items:
             return []
 
         q_stems = _extract_meaningful_stems(query)
         if not q_stems:
             q_stems = set(re.findall(r"[a-zA-Z0-9_\u0600-\u06FF]{2,}", query.lower()))
 
-        for cand in candidates:
+        for cand in items:
             c_stems = _extract_meaningful_stems(cand.text)
             sec_stems = _extract_meaningful_stems(cand.metadata.page_or_section or "")
 
@@ -53,5 +60,5 @@ class HybridOverlapReranker(BaseReranker):
             )
             cand.rerank_score = round(min(1.0, final_score), 4)
 
-        ranked = sorted(candidates, key=lambda x: x.rerank_score, reverse=True)
+        ranked = sorted(items, key=lambda x: x.rerank_score, reverse=True)
         return ranked[:top_k]
