@@ -1,7 +1,7 @@
 import re
 import hashlib
 from dataclasses import replace
-from typing import List, Optional
+from typing import List, Optional, Any
 from core.interfaces import BaseChunker
 from core.schemas import RawDocument, DocumentChunk
 from core.registry import registry
@@ -27,17 +27,25 @@ def _detect_content_type(text: str) -> str:
 class RecursiveHierarchyChunker(BaseChunker):
     def __init__(
         self,
-        chunk_size: int = 512,
-        chunk_overlap: int = 64,
+        chunk_size: Any = 512,
+        chunk_overlap: Any = 64,
+        boundary_lookback_ratio: Any = 0.6,
         separators: Optional[List[str]] = None,
+        **kwargs: Any,
     ):
-        if chunk_size <= 0:
+        # Defensive casting in case values come as unparsed template strings or raw types
+        cs = 512 if isinstance(chunk_size, str) and "${" in chunk_size else int(chunk_size)
+        co = 64 if isinstance(chunk_overlap, str) and "${" in chunk_overlap else int(chunk_overlap)
+        blr = 0.6 if isinstance(boundary_lookback_ratio, str) and "${" in boundary_lookback_ratio else float(boundary_lookback_ratio)
+
+        if cs <= 0:
             raise ValueError("chunk_size must be strictly positive.")
-        if chunk_overlap < 0 or chunk_overlap >= chunk_size:
+        if co < 0 or co >= cs:
             raise ValueError("chunk_overlap must be >= 0 and < chunk_size.")
 
-        self.chunk_size = chunk_size
-        self.chunk_overlap = chunk_overlap
+        self.chunk_size = cs
+        self.chunk_overlap = co
+        self.boundary_lookback_ratio = blr
         self.separators = separators or ["\n\n", "\n", ". ", "؟ ", "! ", " "]
 
     def _split_text(self, text: str) -> List[str]:
@@ -61,24 +69,32 @@ class RecursiveHierarchyChunker(BaseChunker):
             else:
                 if current_chunk:
                     chunks.append(current_chunk)
-                    overlap_tail = current_chunk[-self.chunk_overlap :].strip() if self.chunk_overlap > 0 else ""
+                    tail_start = len(current_chunk) - self.chunk_overlap
+                    if tail_start > 0 and current_chunk[tail_start - 1] not in " \n\t":
+                        space_idx = current_chunk.find(" ", tail_start)
+                        if space_idx != -1:
+                            tail_start = space_idx + 1
+                    overlap_tail = current_chunk[max(0, tail_start):].strip() if self.chunk_overlap > 0 else ""
                     current_chunk = f"{overlap_tail} {seg}".strip() if overlap_tail else seg.strip()
                 else:
                     current_chunk = seg.strip()
 
-                step = max(1, self.chunk_size - self.chunk_overlap)
+                min_cut = int(self.chunk_size * self.boundary_lookback_ratio)
                 while len(current_chunk) > self.chunk_size:
-                    # SWE Decision: Look-back for safe boundary (space or newline) to prevent word slicing
                     cut_point = self.chunk_size
-                    while cut_point > 0 and current_chunk[cut_point - 1] not in " \n\t":
+                    while cut_point > min_cut and current_chunk[cut_point - 1] not in " \n\t":
                         cut_point -= 1
-                    
-                    # If no safe space found, fallback to hard cut
-                    if cut_point == 0:
+                    if cut_point <= min_cut:
                         cut_point = self.chunk_size
-                        
+
                     chunks.append(current_chunk[:cut_point].strip())
-                    current_chunk = current_chunk[cut_point - self.chunk_overlap:].strip()
+
+                    next_start = max(0, cut_point - self.chunk_overlap)
+                    if next_start > 0 and next_start < cut_point and current_chunk[next_start - 1] not in " \n\t":
+                        first_space = current_chunk.find(" ", next_start, cut_point)
+                        if first_space != -1:
+                            next_start = first_space + 1
+                    current_chunk = current_chunk[next_start:].strip()
 
         if current_chunk:
             chunks.append(current_chunk)
@@ -109,15 +125,25 @@ class RecursiveHierarchyChunker(BaseChunker):
             )
         return result
 
-# Decorator/Wrapper Pattern - enhances the recursive chunker with metadata extraction capabilities 
+
 @registry.register_chunker("markdown_section_chunker")
 class MarkdownSectionChunker(BaseChunker):
     HEADER_REGEX = re.compile(r"^(#{1,4}\s+.+|\d+(?:\.\d+)*\s+[A-Z\u0600-\u06FF].+)$", re.MULTILINE)
 
-    def __init__(self, chunk_size: int = 512, chunk_overlap: int = 64):
+    def __init__(
+        self,
+        chunk_size: Any = 512,
+        chunk_overlap: Any = 64,
+        boundary_lookback_ratio: Any = 0.6,
+        separators: Optional[List[str]] = None,
+        **kwargs: Any,
+    ):
         self.inner_chunker = RecursiveHierarchyChunker(
             chunk_size=chunk_size,
             chunk_overlap=chunk_overlap,
+            boundary_lookback_ratio=boundary_lookback_ratio,
+            separators=separators,
+            **kwargs,
         )
 
     def chunk(self, document: RawDocument) -> List[DocumentChunk]:
